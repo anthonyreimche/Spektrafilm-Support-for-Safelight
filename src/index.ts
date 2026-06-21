@@ -238,12 +238,16 @@ export function activate(api: SafelightAPI): void {
         onChange: (v: number) => setDynParam(`${STAGE_ID}.${key}`, v),
       });
 
+    // Style with the SAME compiled utility classes core uses for its own
+    // selects/labels (see SettingsFieldList `inputCls`). They're already in the
+    // app's CSS because core uses them, so the dropdown matches the app exactly
+    // — and avoids the native <select> falling back to the OS default font.
     return React.createElement(
       "div",
-      { style: { padding: 8, display: "flex", flexDirection: "column", gap: 6 } },
+      { className: "flex flex-col gap-1.5 p-2" },
       React.createElement(
         "label",
-        { style: { fontSize: 11, color: "var(--color-text-secondary)" } },
+        { className: "text-[11px] text-text-secondary" },
         "Film stock",
       ),
       React.createElement(
@@ -257,17 +261,8 @@ export function activate(api: SafelightAPI): void {
             api.settings.set("stock", id);
             uploadStock(api, id);
           },
-          style: {
-            width: "100%",
-            boxSizing: "border-box",
-            background: "var(--color-surface-2)",
-            color: "var(--color-text-primary)",
-            border: "1px solid var(--color-border)",
-            borderRadius: 4,
-            padding: "2px 4px",
-            fontFamily: "inherit",
-            fontSize: 11,
-          },
+          className:
+            "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3",
         },
         STOCKS.map((s) =>
           React.createElement("option", { key: s.id, value: s.id }, s.name),

@@ -1,4 +1,4 @@
-function p(e) {
+function d(e) {
   return e = Math.min(1, Math.max(0, e)), e <= 31308e-7 ? e * 12.92 : 1.055 * Math.pow(e, 1 / 2.4) - 0.055;
 }
 function v(e) {
@@ -6,11 +6,11 @@ function v(e) {
 }
 function T() {
   const t = new Uint8Array(143748);
-  for (let o = 0; o < 33; o++)
-    for (let a = 0; a < 33; a++)
-      for (let r = 0; r < 33; r++) {
-        const S = o * 33 + r, i = (a * 1089 + S) * 4;
-        t[i] = Math.round(p(v(r / 32)) * 255), t[i + 1] = Math.round(p(v(a / 32)) * 255), t[i + 2] = Math.round(p(v(o / 32)) * 255), t[i + 3] = 255;
+  for (let a = 0; a < 33; a++)
+    for (let s = 0; s < 33; s++)
+      for (let o = 0; o < 33; o++) {
+        const S = a * 33 + o, c = (s * 1089 + S) * 4;
+        t[c] = Math.round(d(v(o / 32)) * 255), t[c + 1] = Math.round(d(v(s / 32)) * 255), t[c + 2] = Math.round(d(v(a / 32)) * 255), t[c + 3] = 255;
       }
   return t;
 }
@@ -38,7 +38,7 @@ vec3 sfSampleLut(sampler2D atlas, vec3 rgb, float n) {
   vec3 c1 = texture(atlas, vec2(u1, v)).rgb;
   return mix(c0, c1, fb);
 }
-`, y = [], l = "spektrafilm-support.film", c = [
+`, y = [], l = "spektrafilm-support.film", i = [
   { id: "neutral", name: "Neutral (no film baked)", atlas: T },
   ...y
 ], k = {
@@ -82,9 +82,9 @@ vec3 sfSampleLut(sampler2D atlas, vec3 rgb, float n) {
 };
 let f = null, P = 1, u = null;
 function _(e, t) {
-  const o = c.find((a) => a.id === t) ?? c[0];
+  const a = i.find((s) => s.id === t) ?? i[0];
   e.setStageTexture(l, "filmLut", {
-    data: o.atlas(),
+    data: a.atlas(),
     width: 1089,
     height: 33,
     format: "rgba8",
@@ -97,72 +97,62 @@ function H(e) {
     [`${l}.halation`]: 0,
     [`${l}.grain`]: 0
   });
-  const t = c[0].id;
+  const t = i[0].id;
   e.settings.set("stock", t), _(e, t), u == null || u(t);
 }
 function V(e) {
   f = e;
   const t = e.react;
-  e.registerProcessingStage(I), _(e, e.settings.get("stock", c[0].id));
-  function o() {
-    const a = e.components.Slider, r = e.stores.useDevelopStore, S = r((n) => n.paramBag), b = r((n) => n.setDynParam), [i, d] = t.useState(() => e.settings.get("stock", c[0].id));
-    t.useEffect(() => (u = d, () => {
-      u === d && (u = null);
+  e.registerProcessingStage(I), _(e, e.settings.get("stock", i[0].id));
+  function a() {
+    const s = e.components.Slider, o = e.stores.useDevelopStore, S = o((n) => n.paramBag), x = o((n) => n.setDynParam), [c, g] = t.useState(() => e.settings.get("stock", i[0].id));
+    t.useEffect(() => (u = g, () => {
+      u === g && (u = null);
     }), []);
-    const E = (n, s) => {
+    const A = (n, r) => {
       const m = S[`${l}.${n}`];
-      return typeof m == "number" ? m : s;
-    }, g = (n, s, m, A, x) => t.createElement(a, {
-      label: s,
-      value: E(n, x),
+      return typeof m == "number" ? m : r;
+    }, p = (n, r, m, b, E) => t.createElement(s, {
+      label: r,
+      value: A(n, E),
       min: m,
-      max: A,
+      max: b,
       step: 0.01,
-      defaultValue: x,
-      onChange: (L) => b(`${l}.${n}`, L)
+      defaultValue: E,
+      onChange: (L) => x(`${l}.${n}`, L)
     });
     return t.createElement(
       "div",
-      { style: { padding: 8, display: "flex", flexDirection: "column", gap: 6 } },
+      { className: "flex flex-col gap-1.5 p-2" },
       t.createElement(
         "label",
-        { style: { fontSize: 11, color: "var(--color-text-secondary)" } },
+        { className: "text-[11px] text-text-secondary" },
         "Film stock"
       ),
       t.createElement(
         "select",
         {
-          value: i,
+          value: c,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onChange: (n) => {
-            const s = n.target.value;
-            d(s), e.settings.set("stock", s), _(e, s);
+            const r = n.target.value;
+            g(r), e.settings.set("stock", r), _(e, r);
           },
-          style: {
-            width: "100%",
-            boxSizing: "border-box",
-            background: "var(--color-surface-2)",
-            color: "var(--color-text-primary)",
-            border: "1px solid var(--color-border)",
-            borderRadius: 4,
-            padding: "2px 4px",
-            fontFamily: "inherit",
-            fontSize: 11
-          }
+          className: "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3"
         },
-        c.map(
+        i.map(
           (n) => t.createElement("option", { key: n.id, value: n.id }, n.name)
         )
       ),
-      g("exposure", "Print Exposure", -3, 3, 0),
-      g("halation", "Halation", 0, 1, 0),
-      g("grain", "Grain", 0, 1, 0)
+      p("exposure", "Print Exposure", -3, 3, 0),
+      p("halation", "Halation", 0, 1, 0),
+      p("grain", "Grain", 0, 1, 0)
     );
   }
   e.registerPanel({
     id: "spektrafilm-support.panel",
     title: "Spektrafilm",
-    component: o,
+    component: a,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
     onReset: () => H(e)
   });
