@@ -1,33 +1,22 @@
 // Spektrafilm Support — SafeLight extension (GPL-3.0-or-later)
 //
-// Brings the look of the GPLv3 Spektrafilm spectral film simulation
-// (https://github.com/andreavolpato/spektrafilm) into SafeLight as a real-time
-// GPU stage. The expensive part — reconstructing a spectrum per pixel, exposing
-// a virtual emulsion, developing dye densities, printing and scanning — is NOT
-// done per frame. It is baked offline into a 3D LUT by Spektrafilm's own
-// `spektrafilm-lut` CLI (.cube), converted to an atlas by tools/cube_to_stocks.mjs,
-// and uploaded to a processing stage as a texture. The per-frame hot path is
-// then a single tetrahedral LUT lookup + an optional halation prepass + grain.
+// Runs the Spektrafilm spectral film simulation LIVE per pixel on the GPU — not
+// a frozen LUT. The 5-stage pipeline (expose → develop → print-expose → print-
+// develop → scan) is transliterated to GLSL in film-glsl.ts (validated stage-by-
+// stage against the engine), driven by per-stock spectral data (3 rgba16f
+// textures + a GLSL const block) extracted by tools/extract_stock.py. Exposure
+// and print exposure are live uniforms.
 //
-// The film transform runs at the `tone-map` phase on scene-linear `lin` and
-// writes scene-linear print colour, which SafeLight's display transform then
-// encodes. The extension registers a matching "Spektrafilm" display transform
-// (plain encode, base curve off) — select it in Preferences ▸ Rendering so the
-// film isn't tone-mapped a second time by AgX/ACES.
+// Pair with the "Spektrafilm" display transform (registered below): the film IS
+// the tone rendering, so the view transform is a plain encode with the base
+// curve off.
 
-import {
-  ATLAS_W,
-  ATLAS_H,
-  LUT_SIZE,
-  LUT_GLSL_HELPERS,
-  buildIdentityAtlas,
-  type Stock,
-} from "./lut";
-import { BAKED_STOCKS } from "./stocks.generated";
+import { FILM_HELPERS, FILM_GLSL } from "./film-glsl";
+import { FILM_STOCKS, type FilmStockData } from "./stocks_data.generated";
 
-// ─── Minimal SafeLight API surface (the host injects the real thing) ─────────
+// ─── Minimal SafeLight API surface ───────────────────────────────────────────
 
-type GlslType = "float" | "int" | "bool" | "vec2" | "vec3" | "vec4" | "sampler2D";
+type GlslType = "float" | "vec2" | "vec3" | "vec4" | "sampler2D";
 
 interface UniformDeclaration {
   key: string;
@@ -42,14 +31,7 @@ interface TextureRequirement {
   kind: "lut" | "coverage" | "dynamic";
   width?: number;
   height?: number;
-  format?: "rgba8" | "r8";
-}
-
-interface StagePass {
-  glsl: string;
-  helpers?: string;
-  iterations?: number;
-  uniforms?: UniformDeclaration[];
+  format?: "rgba8" | "r8" | "rgba16f" | "r16f";
 }
 
 interface ProcessingStageContribution {
@@ -60,15 +42,14 @@ interface ProcessingStageContribution {
   glsl: string;
   helpers?: string;
   uniforms: UniformDeclaration[];
-  passes?: StagePass[];
   textures?: TextureRequirement[];
 }
 
 interface StageTextureData {
-  data: Uint8Array;
+  data: Uint8Array | Float32Array;
   width: number;
   height: number;
-  format: "rgba8" | "r8";
+  format: "rgba8" | "r8" | "rgba16f" | "r16f";
   version: number;
 }
 
@@ -76,7 +57,6 @@ interface PipelineContribution {
   id: string;
   name: string;
   description?: string;
-  /** Body defining `vec3 pipelineToDisplay(vec3 lin)`. */
   glsl?: string;
   skipBaseCurve?: boolean;
 }
@@ -92,18 +72,12 @@ interface SafelightAPI {
     title: string;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     component: any;
-    defaultDock?: {
-      module: "library" | "develop";
-      direction: "left" | "right";
-      order?: number;
-      width?: number;
-    };
+    defaultDock?: { module: "library" | "develop"; direction: "left" | "right"; order?: number; width?: number };
     onReset?: () => void;
   }): void;
   settings: {
     get<T>(key: string, fallback: T): T;
     set(key: string, value: unknown): void;
-    onChange(cb: (key: string, value: unknown) => void): () => void;
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   components: Record<string, any>;
@@ -111,104 +85,52 @@ interface SafelightAPI {
   stores: Record<string, any>;
 }
 
-// ─── Stage definition ────────────────────────────────────────────────────────
+// ─── Stage ───────────────────────────────────────────────────────────────────
 
 const STAGE_ID = "spektrafilm-support.film";
 
-// Available film stocks: the neutral placeholder, plus whatever the bake tool
-// has generated. With no baked stocks the image renders ~normally.
-const STOCKS: Stock[] = [
-  { id: "neutral", name: "Neutral (no film baked)", atlas: buildIdentityAtlas },
-  ...BAKED_STOCKS,
-];
-
-// Halation prepass: threshold highlights (pass 0), then separable Gaussian blur
-// (horizontal pass 0, vertical pass 1). The blurred highlight mask is exposed to
-// the film stage's inline glsl as `stageResult`. Skipped entirely (zero cost)
-// when Halation is 0 — the engine only runs prepasses for stages with a non-zero
-// param, and the inline glsl multiplies the result by the halation amount.
-const HALATION_PASS: StagePass = {
-  iterations: 2,
-  glsl: `
-    vec3 sum = vec3(0.0);
-    float wsum = 0.0;
-    for (int i = -6; i <= 6; i++) {
-      float w = exp(-float(i * i) / 18.0);
-      vec2 off = (uPassIndex == 0) ? vec2(float(i), 0.0) : vec2(0.0, float(i));
-      vec3 s = readPrev(vUv + off * uTexel * 3.0);
-      if (uPassIndex == 0) s = max(s - 0.7, vec3(0.0));
-      sum += s * w;
-      wsum += w;
-    }
-    c = sum / wsum;
-  `,
-};
-
-// Inline film transform on scene-linear `lin`. Print Exposure scales the input;
-// linearToSrgb encodes it into the LUT's sRGB input domain (clamping to [0,1]);
-// the LUT output (sRGB-encoded print colour, for 8-bit precision) is decoded
-// back to linear so SafeLight's display transform encodes it once. Halation adds
-// the blurred highlight mask, tinted red-orange; grain is a luminance-neutral
-// multiplicative dither.
-const FILM_GLSL = `
-  vec3 linExp = lin * exp2(exposure);
-  vec3 film = srgbToLinear(sfSampleLut(filmLut, linearToSrgb(linExp), cubeSize));
-  film += stageResult * vec3(1.0, 0.4, 0.15) * halation;
-  float noise = (sfHash(srcUv * vec2(1543.0, 2087.0)) - 0.5) * grain * 0.08;
-  lin = max(film * (1.0 + noise), vec3(0.0));
-`;
-
-const FILM_STAGE: ProcessingStageContribution = {
-  id: STAGE_ID,
-  name: "Spektrafilm",
-  phase: "tone-map",
-  uniforms: [
-    { key: "exposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Print Exposure" },
-    { key: "halation", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Halation" },
-    { key: "grain", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Grain" },
-    // Cube edge, fixed at the baked LUT size; not user-facing.
-    { key: "cubeSize", glslType: "float", default: LUT_SIZE },
-  ],
-  textures: [
-    { key: "filmLut", kind: "lut", width: ATLAS_W, height: ATLAS_H, format: "rgba8" },
-  ],
-  helpers: LUT_GLSL_HELPERS,
-  glsl: FILM_GLSL,
-  passes: [HALATION_PASS],
-};
-
-// ─── Activation ────────────────────────────────────────────────────────────
+function buildStage(stock: FilmStockData): ProcessingStageContribution {
+  return {
+    id: STAGE_ID,
+    name: "Spektrafilm",
+    phase: "tone-map",
+    uniforms: [
+      { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
+      { key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" },
+    ],
+    textures: [
+      { key: "filmTc", kind: "lut", format: "rgba16f" },
+      { key: "filmCurves", kind: "lut", format: "rgba16f" },
+      { key: "filmSpec", kind: "lut", format: "rgba16f" },
+    ],
+    // Per-stock spectral constants are inlined as GLSL consts; changing stock
+    // re-registers (recompiles) — cheap and rare. Live params stay uniforms.
+    helpers: FILM_HELPERS + "\n" + stock.consts,
+    glsl: FILM_GLSL,
+  };
+}
 
 let theApi: SafelightAPI | null = null;
 let texVersion = 1;
-// Bound by the mounted panel so the dock-header "Reset to defaults" action can
-// also sync the stock dropdown's local state.
 let setPanelStock: ((id: string) => void) | null = null;
 
-function uploadStock(api: SafelightAPI, id: string): void {
-  const stock = STOCKS.find((s) => s.id === id) ?? STOCKS[0];
-  api.setStageTexture(STAGE_ID, "filmLut", {
-    data: stock.atlas(),
-    width: ATLAS_W,
-    height: ATLAS_H,
-    format: "rgba8",
-    version: texVersion++,
-  });
+function applyStock(api: SafelightAPI, id: string): void {
+  const stock = FILM_STOCKS.find((s) => s.id === id) ?? FILM_STOCKS[0];
+  api.registerProcessingStage(buildStage(stock));
+  const v = ++texVersion;
+  api.setStageTexture(STAGE_ID, "filmTc", { data: stock.filmTc(), width: stock.tcSize, height: stock.tcSize, format: "rgba16f", version: v });
+  api.setStageTexture(STAGE_ID, "filmCurves", { data: stock.filmCurves(), width: 256, height: 3, format: "rgba16f", version: v });
+  api.setStageTexture(STAGE_ID, "filmSpec", { data: stock.filmSpec(), width: 81, height: 4, format: "rgba16f", version: v });
 }
 
-// Restore the panel's controls to their defaults: the sliders to 0 (one undoable
-// action) and the stock back to the first entry. Wired to the panel's `onReset`,
-// so right-clicking the panel's dock header offers "Reset to defaults" — the same
-// mechanism the built-in panels use.
 function resetPanel(api: SafelightAPI): void {
   api.stores.useDevelopStore.getState().setDynParams({
-    [`${STAGE_ID}.exposure`]: 0,
-    [`${STAGE_ID}.halation`]: 0,
-    [`${STAGE_ID}.grain`]: 0,
+    [`${STAGE_ID}.sfExposure`]: 0,
+    [`${STAGE_ID}.sfPrintExp`]: 1,
   });
-  const def = STOCKS[0].id;
+  const def = FILM_STOCKS[0].id;
   api.settings.set("stock", def);
-  uploadStock(api, def);
+  applyStock(api, def);
   setPanelStock?.(def);
 }
 
@@ -216,23 +138,16 @@ export function activate(api: SafelightAPI): void {
   theApi = api;
   const React = api.react;
 
-  api.registerProcessingStage(FILM_STAGE);
+  applyStock(api, api.settings.get("stock", FILM_STOCKS[0].id));
 
-  // Display transform to pair with the film stage. The film stock IS the tone
-  // rendering, so the correct view transform is a plain encode with NO extra
-  // tone map (not AgX/ACES) and the RAW base contrast curve OFF (skipBaseCurve)
-  // — so the stage receives clean scene-linear. Select "Spektrafilm" in
-  // Preferences ▸ Rendering when using the film stocks.
   api.registerPipeline({
     id: "spektrafilm-support.transform",
     name: "Spektrafilm",
     description:
-      "Plain sRGB encode with the RAW base curve off — the correct view transform for Spektrafilm film stocks (the film provides the tone rendering). Avoids a second tone map on top of the film.",
+      "Plain sRGB encode with the RAW base curve off — the correct view transform for the Spektrafilm film stage (the film provides the tone rendering).",
     glsl: "vec3 pipelineToDisplay(vec3 lin) { return linearToSrgbU(lin); }",
     skipBaseCurve: true,
   });
-
-  uploadStock(api, api.settings.get("stock", STOCKS[0].id));
 
   function SpektrafilmPanel() {
     const Slider = api.components.Slider;
@@ -241,14 +156,11 @@ export function activate(api: SafelightAPI): void {
     const paramBag: Record<string, unknown> = useDevelopStore((s: any) => s.paramBag);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const setDynParam: (k: string, v: number) => void = useDevelopStore((s: any) => s.setDynParam);
-    const [stock, setStock] = React.useState(() => api.settings.get("stock", STOCKS[0].id));
+    const [stock, setStock] = React.useState(() => api.settings.get("stock", FILM_STOCKS[0].id));
 
-    // Expose this panel's stock setter to resetPanel while it's mounted.
     React.useEffect(() => {
       setPanelStock = setStock;
-      return () => {
-        if (setPanelStock === setStock) setPanelStock = null;
-      };
+      return () => { if (setPanelStock === setStock) setPanelStock = null; };
     }, []);
 
     const val = (k: string, d: number): number => {
@@ -257,27 +169,14 @@ export function activate(api: SafelightAPI): void {
     };
     const slider = (key: string, label: string, min: number, max: number, dflt: number) =>
       React.createElement(Slider, {
-        label,
-        value: val(key, dflt),
-        min,
-        max,
-        step: 0.01,
-        defaultValue: dflt,
+        label, value: val(key, dflt), min, max, step: 0.01, defaultValue: dflt,
         onChange: (v: number) => setDynParam(`${STAGE_ID}.${key}`, v),
       });
 
-    // Style with the SAME compiled utility classes core uses for its own
-    // selects/labels (see SettingsFieldList `inputCls`). They're already in the
-    // app's CSS because core uses them, so the dropdown matches the app exactly
-    // — and avoids the native <select> falling back to the OS default font.
     return React.createElement(
       "div",
       { className: "flex flex-col gap-1.5 p-2" },
-      React.createElement(
-        "label",
-        { className: "text-[11px] text-text-secondary" },
-        "Film stock",
-      ),
+      React.createElement("label", { className: "text-[11px] text-text-secondary" }, "Film stock"),
       React.createElement(
         "select",
         {
@@ -287,18 +186,14 @@ export function activate(api: SafelightAPI): void {
             const id = e.target.value as string;
             setStock(id);
             api.settings.set("stock", id);
-            uploadStock(api, id);
+            applyStock(api, id);
           },
-          className:
-            "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3",
+          className: "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3",
         },
-        STOCKS.map((s) =>
-          React.createElement("option", { key: s.id, value: s.id }, s.name),
-        ),
+        FILM_STOCKS.map((s) => React.createElement("option", { key: s.id, value: s.id }, s.name)),
       ),
-      slider("exposure", "Print Exposure", -3, 3, 0),
-      slider("halation", "Halation", 0, 1, 0),
-      slider("grain", "Grain", 0, 1, 0),
+      slider("sfExposure", "Exposure", -3, 3, 0),
+      slider("sfPrintExp", "Print Exposure", 0.2, 3, 1),
     );
   }
 
@@ -312,7 +207,8 @@ export function activate(api: SafelightAPI): void {
 }
 
 export function deactivate(): void {
-  // Release the uploaded LUT; SafeLight sweeps the stage + panel itself.
-  theApi?.setStageTexture(STAGE_ID, "filmLut", null);
+  theApi?.setStageTexture(STAGE_ID, "filmTc", null);
+  theApi?.setStageTexture(STAGE_ID, "filmCurves", null);
+  theApi?.setStageTexture(STAGE_ID, "filmSpec", null);
   theApi = null;
 }
