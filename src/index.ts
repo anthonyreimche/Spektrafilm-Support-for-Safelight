@@ -168,6 +168,9 @@ const FILM_STAGE: ProcessingStageContribution = {
 
 let theApi: SafelightAPI | null = null;
 let texVersion = 1;
+// Bound by the mounted panel so the dock-header "Reset to defaults" action can
+// also sync the stock dropdown's local state.
+let setPanelStock: ((id: string) => void) | null = null;
 
 function uploadStock(api: SafelightAPI, id: string): void {
   const stock = STOCKS.find((s) => s.id === id) ?? STOCKS[0];
@@ -178,6 +181,22 @@ function uploadStock(api: SafelightAPI, id: string): void {
     format: "rgba8",
     version: texVersion++,
   });
+}
+
+// Restore the panel's controls to their defaults: the sliders to 0 (one undoable
+// action) and the stock back to the first entry. Wired to the panel's `onReset`,
+// so right-clicking the panel's dock header offers "Reset to defaults" — the same
+// mechanism the built-in panels use.
+function resetPanel(api: SafelightAPI): void {
+  api.stores.useDevelopStore.getState().setDynParams({
+    [`${STAGE_ID}.exposure`]: 0,
+    [`${STAGE_ID}.halation`]: 0,
+    [`${STAGE_ID}.grain`]: 0,
+  });
+  const def = STOCKS[0].id;
+  api.settings.set("stock", def);
+  uploadStock(api, def);
+  setPanelStock?.(def);
 }
 
 export function activate(api: SafelightAPI): void {
@@ -196,6 +215,14 @@ export function activate(api: SafelightAPI): void {
     const setDynParam: (k: string, v: number) => void = useDevelopStore((s: any) => s.setDynParam);
     const [stock, setStock] = React.useState(() => api.settings.get("stock", STOCKS[0].id));
 
+    // Expose this panel's stock setter to resetPanel while it's mounted.
+    React.useEffect(() => {
+      setPanelStock = setStock;
+      return () => {
+        if (setPanelStock === setStock) setPanelStock = null;
+      };
+    }, []);
+
     const val = (k: string, d: number): number => {
       const v = paramBag[`${STAGE_ID}.${k}`];
       return typeof v === "number" ? v : d;
@@ -213,10 +240,10 @@ export function activate(api: SafelightAPI): void {
 
     return React.createElement(
       "div",
-      { style: { padding: 12, display: "flex", flexDirection: "column", gap: 10 } },
+      { style: { padding: 8, display: "flex", flexDirection: "column", gap: 6 } },
       React.createElement(
         "label",
-        { style: { fontSize: 12, color: "var(--color-text-secondary)" } },
+        { style: { fontSize: 11, color: "var(--color-text-secondary)" } },
         "Film stock",
       ),
       React.createElement(
@@ -231,12 +258,15 @@ export function activate(api: SafelightAPI): void {
             uploadStock(api, id);
           },
           style: {
+            width: "100%",
+            boxSizing: "border-box",
             background: "var(--color-surface-2)",
             color: "var(--color-text-primary)",
             border: "1px solid var(--color-border)",
             borderRadius: 4,
-            padding: "4px 6px",
-            fontSize: 13,
+            padding: "2px 4px",
+            fontFamily: "inherit",
+            fontSize: 11,
           },
         },
         STOCKS.map((s) =>
@@ -254,6 +284,7 @@ export function activate(api: SafelightAPI): void {
     title: "Spektrafilm",
     component: SpektrafilmPanel,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
+    onReset: () => resetPanel(api),
   });
 }
 

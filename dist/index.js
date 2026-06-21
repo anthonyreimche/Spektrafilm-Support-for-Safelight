@@ -1,20 +1,20 @@
-function d(e) {
+function p(e) {
   return e = Math.min(1, Math.max(0, e)), e <= 31308e-7 ? e * 12.92 : 1.055 * Math.pow(e, 1 / 2.4) - 0.055;
 }
-function g(e) {
+function v(e) {
   return Math.pow(2, e * 16 + -10);
 }
-function L() {
+function T() {
   const t = new Uint8Array(143748);
-  for (let a = 0; a < 33; a++)
-    for (let o = 0; o < 33; o++)
-      for (let l = 0; l < 33; l++) {
-        const m = a * 33 + l, s = (o * 1089 + m) * 4;
-        t[s] = Math.round(d(g(l / 32)) * 255), t[s + 1] = Math.round(d(g(o / 32)) * 255), t[s + 2] = Math.round(d(g(a / 32)) * 255), t[s + 3] = 255;
+  for (let o = 0; o < 33; o++)
+    for (let a = 0; a < 33; a++)
+      for (let r = 0; r < 33; r++) {
+        const S = o * 33 + r, i = (a * 1089 + S) * 4;
+        t[i] = Math.round(p(v(r / 32)) * 255), t[i + 1] = Math.round(p(v(a / 32)) * 255), t[i + 2] = Math.round(p(v(o / 32)) * 255), t[i + 3] = 255;
       }
   return t;
 }
-const T = `
+const h = `
 const float SF_MIN_EV = ${(-10).toFixed(1)};
 const float SF_MAX_EV = ${6 .toFixed(1)};
 vec3 sfShaper(vec3 lv) {
@@ -38,10 +38,10 @@ vec3 sfSampleLut(sampler2D atlas, vec3 rgb, float n) {
   vec3 c1 = texture(atlas, vec2(u1, v)).rgb;
   return mix(c0, c1, fb);
 }
-`, h = [], u = "spektrafilm-support.film", i = [
-  { id: "neutral", name: "Neutral (no film baked)", atlas: L },
-  ...h
-], y = {
+`, y = [], l = "spektrafilm-support.film", c = [
+  { id: "neutral", name: "Neutral (no film baked)", atlas: T },
+  ...y
+], k = {
   iterations: 2,
   glsl: `
     vec3 sum = vec3(0.0);
@@ -56,14 +56,14 @@ vec3 sfSampleLut(sampler2D atlas, vec3 rgb, float n) {
     }
     c = sum / wsum;
   `
-}, k = `
+}, M = `
   vec3 linExp = lin * exp2(exposure);
   vec3 film = srgbToLinear(sfSampleLut(filmLut, sfShaper(linExp), cubeSize));
   film += stageResult * vec3(1.0, 0.4, 0.15) * halation;
   float noise = (sfHash(srcUv * vec2(1543.0, 2087.0)) - 0.5) * grain * 0.08;
   lin = max(film * (1.0 + noise), vec3(0.0));
-`, M = {
-  id: u,
+`, I = {
+  id: l,
   name: "Spektrafilm",
   phase: "tone-map",
   uniforms: [
@@ -76,85 +76,102 @@ vec3 sfSampleLut(sampler2D atlas, vec3 rgb, float n) {
   textures: [
     { key: "filmLut", kind: "lut", width: 1089, height: 33, format: "rgba8" }
   ],
-  helpers: T,
-  glsl: k,
-  passes: [y]
+  helpers: h,
+  glsl: M,
+  passes: [k]
 };
-let c = null, I = 1;
+let f = null, P = 1, u = null;
 function _(e, t) {
-  const a = i.find((o) => o.id === t) ?? i[0];
-  e.setStageTexture(u, "filmLut", {
-    data: a.atlas(),
+  const o = c.find((a) => a.id === t) ?? c[0];
+  e.setStageTexture(l, "filmLut", {
+    data: o.atlas(),
     width: 1089,
     height: 33,
     format: "rgba8",
-    version: I++
+    version: P++
   });
 }
-function P(e) {
-  c = e;
+function H(e) {
+  e.stores.useDevelopStore.getState().setDynParams({
+    [`${l}.exposure`]: 0,
+    [`${l}.halation`]: 0,
+    [`${l}.grain`]: 0
+  });
+  const t = c[0].id;
+  e.settings.set("stock", t), _(e, t), u == null || u(t);
+}
+function V(e) {
+  f = e;
   const t = e.react;
-  e.registerProcessingStage(M), _(e, e.settings.get("stock", i[0].id));
-  function a() {
-    const o = e.components.Slider, l = e.stores.useDevelopStore, m = l((n) => n.paramBag), p = l((n) => n.setDynParam), [s, E] = t.useState(() => e.settings.get("stock", i[0].id)), b = (n, r) => {
-      const f = m[`${u}.${n}`];
-      return typeof f == "number" ? f : r;
-    }, S = (n, r, f, x, v) => t.createElement(o, {
-      label: r,
-      value: b(n, v),
-      min: f,
-      max: x,
+  e.registerProcessingStage(I), _(e, e.settings.get("stock", c[0].id));
+  function o() {
+    const a = e.components.Slider, r = e.stores.useDevelopStore, S = r((n) => n.paramBag), b = r((n) => n.setDynParam), [i, d] = t.useState(() => e.settings.get("stock", c[0].id));
+    t.useEffect(() => (u = d, () => {
+      u === d && (u = null);
+    }), []);
+    const E = (n, s) => {
+      const m = S[`${l}.${n}`];
+      return typeof m == "number" ? m : s;
+    }, g = (n, s, m, A, x) => t.createElement(a, {
+      label: s,
+      value: E(n, x),
+      min: m,
+      max: A,
       step: 0.01,
-      defaultValue: v,
-      onChange: (A) => p(`${u}.${n}`, A)
+      defaultValue: x,
+      onChange: (L) => b(`${l}.${n}`, L)
     });
     return t.createElement(
       "div",
-      { style: { padding: 12, display: "flex", flexDirection: "column", gap: 10 } },
+      { style: { padding: 8, display: "flex", flexDirection: "column", gap: 6 } },
       t.createElement(
         "label",
-        { style: { fontSize: 12, color: "var(--color-text-secondary)" } },
+        { style: { fontSize: 11, color: "var(--color-text-secondary)" } },
         "Film stock"
       ),
       t.createElement(
         "select",
         {
-          value: s,
+          value: i,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onChange: (n) => {
-            const r = n.target.value;
-            E(r), e.settings.set("stock", r), _(e, r);
+            const s = n.target.value;
+            d(s), e.settings.set("stock", s), _(e, s);
           },
           style: {
+            width: "100%",
+            boxSizing: "border-box",
             background: "var(--color-surface-2)",
             color: "var(--color-text-primary)",
             border: "1px solid var(--color-border)",
             borderRadius: 4,
-            padding: "4px 6px",
-            fontSize: 13
+            padding: "2px 4px",
+            fontFamily: "inherit",
+            fontSize: 11
           }
         },
-        i.map(
+        c.map(
           (n) => t.createElement("option", { key: n.id, value: n.id }, n.name)
         )
       ),
-      S("exposure", "Print Exposure", -3, 3, 0),
-      S("halation", "Halation", 0, 1, 0),
-      S("grain", "Grain", 0, 1, 0)
+      g("exposure", "Print Exposure", -3, 3, 0),
+      g("halation", "Halation", 0, 1, 0),
+      g("grain", "Grain", 0, 1, 0)
     );
   }
   e.registerPanel({
     id: "spektrafilm-support.panel",
     title: "Spektrafilm",
-    component: a,
-    defaultDock: { module: "develop", direction: "right", order: 6, width: 260 }
+    component: o,
+    defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
+    onReset: () => H(e)
   });
 }
-function H() {
-  c == null || c.setStageTexture(u, "filmLut", null), c = null;
+function w() {
+  f == null || f.setStageTexture(l, "filmLut", null), f = null;
 }
 export {
-  P as activate,
-  H as deactivate
+  V as activate,
+  w as deactivate
 };
 //# sourceMappingURL=index.js.map
