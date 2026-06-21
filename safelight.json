@@ -1,13 +1,13 @@
 {
-  "id": "spektrafilm-support",
-  "name": "Spektrafilm Support",
-  "version": "1.0.0",
-  "description": "Real-time spectral film simulation — the Spektrafilm look as a baked-LUT GPU stage, with halation and grain.",
-  "author": "SafeLight",
-  "main": "dist/index.js",
-  "license": "GPL-3.0-or-later",
-  "categories": ["Color"],
-  "keywords": ["film", "spektrafilm", "lut", "analog", "halation", "grain"],
-  "repository": "anthonyreimche/Spektrafilm-Support-for-Safelight",
-  "minAppVersion": "1.0.0"
+	"id": "spektrafilm-support",
+	"name": "Spektrafilm Support",
+	"version": "1.0.0",
+	"description": "Real-time spectral film simulation — the Spektrafilm look as a baked-LUT GPU stage, with halation and grain.",
+	"author": "SafeLight",
+	"main": "dist/index.js",
+	"license": "GPL-3.0-or-later",
+	"categories": ["Color"],
+	"keywords": ["film", "spektrafilm", "lut", "analog", "halation", "grain"],
+	"repository": "anthonyreimche/Spektrafilm-Support-for-Safelight",
+	"minAppVersion": "2.1.0"
 }
