@@ -897,7 +897,11 @@ function h(Q, B = !1) {
       vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
       ${E}
       vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
-      vec3 hgl = clamp(sfHalAmount * ${U} * sfHi, 0.0, 1.0);
+      // Gain (×4): the mip blur box-averages, so a highlight's energy is diluted by
+      // its surroundings — a unit of Amount needs a multiplier to read. ×4 puts the
+      // useful range around a natural halo; the screen-blend keeps bright areas from
+      // blowing out, so it glows into darker surroundings rather than washing.
+      vec3 hgl = clamp(sfHalAmount * 4.0 * ${U} * sfHi, 0.0, 1.0);
       c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);`
   };
 }

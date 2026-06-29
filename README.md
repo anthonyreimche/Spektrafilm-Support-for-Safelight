@@ -165,9 +165,11 @@ install/reload.
 - Gamut compression uses ACES RGC as a stand-in for the engine's perceptual
   `cam16ucs` — the spectral stages are exact; only extreme out-of-gamut colours
   differ slightly. (B&W output is neutral, so it has no such residual.)
-- Halation and grain are real-time approximations (separable Gaussian back-
-  reflection bloom; binomial-statistics grain peaking in the midtones), not the
-  engine's full physical models. They run live as prepass / inline effects.
+- Halation and grain are real-time approximations, not the engine's full physical
+  models. Halation is an inline mip-chain bloom of the source highlights (Size =
+  blur LOD), screen-blended and tinted to the stock's anti-halation balance
+  (neutral for B&W); grain is binomial-statistics noise peaking in the midtones.
+  Both run inline in the effects phase.
 - **Black & white** stocks are datasheet-*shaped* parametric models, not measured
   spectral data, and use a single normal-grade paper: grade/contrast is the Paper
   Grade control, not true variable-contrast (two-emulsion) filtration.
