@@ -121,23 +121,24 @@ const DEFAULT_FX: FilmFx = {
 const vec3lit = (v: readonly [number, number, number]) =>
   `vec3(${v.map((x) => x.toFixed(4)).join(", ")})`;
 
-// Slides (reversal) have no enlarger or print paper, so their bundle #defines
-// SF_POSITIVE and the GLSL compiles out the print stages. Drop the print-only
-// uniforms here too (Print Exposure / Filtration M+Y) and retarget Contrast to
-// the film curve, so the panel and the shader agree on what exists.
+// Slides (reversal) have no enlarger or print paper, so their bundle bakes
+// sfPositive = true and the shader branches the print stages out at runtime. That
+// branch is still COMPILED (a const-bool gate, not #ifdef removal), so its print-
+// only uniforms (Print Exposure / Filtration M+Y) must stay declared or the
+// program won't link for a slide. So the uniform set is the same for every path;
+// the PANEL is what hides the print controls for slides (see FILM_CTRLS_POS), and
+// only the Contrast label changes (it targets the film curve on a slide).
 const isSlide = (stock: FilmStockData) => stock.kind === "slide";
 
 function buildStage(stock: FilmStockData): ProcessingStageContribution {
   const slide = isSlide(stock);
   const uniforms: UniformDeclaration[] = [
     { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
-    ...(slide ? [] : [{ key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" } as UniformDeclaration]),
+    { key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" },
     { key: "sfCouplerAmt", glslType: "float", default: 1, range: { min: 0, max: 2, step: 0.01 }, label: "Coupler Amount" },
     { key: "sfContrast", glslType: "float", default: 1, range: { min: 0.5, max: 2, step: 0.01 }, label: slide ? "Contrast" : "Print Contrast" },
-    ...(slide ? [] : [
-      { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" } as UniformDeclaration,
-      { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" } as UniformDeclaration,
-    ]),
+    { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" },
+    { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" },
   ];
   return {
     id: STAGE_ID,
@@ -149,10 +150,18 @@ function buildStage(stock: FilmStockData): ProcessingStageContribution {
       { key: "filmCurves", kind: "lut", format: "rgba16f" },
       { key: "filmSpec", kind: "lut", format: "rgba16f" },
     ],
-    // Per-stock spectral constants are inlined as GLSL consts; changing stock
-    // re-registers (recompiles) — cheap and rare. Live params stay uniforms.
-    helpers: FILM_HELPERS + "\n" + stock.consts,
-    glsl: FILM_GLSL,
+    // Per-stock spectral constants are inlined as GLSL consts. They MUST live in
+    // `glsl` (the stage body), NOT `helpers`: the host's recompile signature hashes
+    // s.glsl but NOT s.helpers (renderer.ts buildStageInjection), so with the consts
+    // in helpers every stock shares the identical FILM_GLSL body → identical sig →
+    // the program cache reuses the FIRST-compiled stock's baked consts for ALL
+    // stocks. That means a stale sfPositive (negatives scanned as positives = tones
+    // inverted; slides run the print path over zeroed lanes = white/grey) plus wrong
+    // matrices/ranges. Putting the consts in the body makes s.glsl differ per stock,
+    // so switching stock recompiles with the right consts — cheap and rare, and the
+    // intended behaviour. Live params stay uniforms.
+    helpers: FILM_HELPERS,
+    glsl: stock.consts + "\n" + FILM_GLSL,
   };
 }
 

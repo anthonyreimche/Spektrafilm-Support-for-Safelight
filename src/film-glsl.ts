@@ -20,11 +20,18 @@
 //   sfNeutralMY(vec2 neutral CC for M/Y), sfDensMax(vec3, positive silver donor)
 // Live uniforms: sfExposure, sfPrintExp, sfCouplerAmt, sfContrast, sfFiltM, sfFiltY.
 //
-// Reversal (slide) bundles #define SF_POSITIVE in their const block: stages 3-4
-// (enlarger print) are skipped, the developed film is scanned directly, and the
-// scan textures (filmSpec row2/row3) carry the FILM's own dye + viewing
-// illuminant instead of a print paper's. Print-only uniforms (sfPrintExp,
-// sfFiltM/Y) are then unused; sfContrast retargets to the film curve.
+// Reversal (slide) bundles bake `const bool sfPositive = true` in their const
+// block (negatives bake false): stages 3-4 (enlarger print) are branched out, the
+// developed film is scanned directly, and the scan textures (filmSpec row2/row3)
+// carry the FILM's own dye + viewing illuminant instead of a print paper's. Print-
+// only uniforms (sfPrintExp, sfFiltM/Y) are then unused, but STILL declared so the
+// untaken print branch compiles; sfContrast retargets to the film curve.
+//
+// The paths are gated by baked `const bool` constants (sfPositive, sfHasNeutral),
+// NOT #define/#ifdef: the host splices stage GLSL into the monolith by substring
+// rewriting, not a preprocessor, so #ifdef gates don't survive. A const-bool is a
+// compile-time constant, so the driver still folds the branch away — same cost as
+// the old #ifdef, but it actually takes effect.
 
 export const N_WL = 81;
 
@@ -93,68 +100,65 @@ export const FILM_GLSL = `
   // (sfDensMax − developed dye), negative film from the dye density itself. The
   // before-couplers curve (dc0) already bakes the positive inversion; only this
   // live donor term differs between the two paths.
-#ifdef SF_POSITIVE
-  vec3 sfSilver = sfDensMax - sfDens;
-#else
-  vec3 sfSilver = sfDens;
-#endif
+  vec3 sfSilver = sfPositive ? (sfDensMax - sfDens) : sfDens;
   vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
-#ifdef SF_POSITIVE
-  // Slides have no print to grade, so Print Contrast becomes a film-curve
-  // contrast: warp developed log-exposure around the film midpoint (1.0 = the
-  // engine's straight reversal curve; >1 harder, <1 softer).
-  float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
-  sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
-#endif
+  if (sfPositive) {
+    // Slides have no print to grade, so Print Contrast becomes a film-curve
+    // contrast: warp developed log-exposure around the film midpoint (1.0 = the
+    // engine's straight reversal curve; >1 harder, <1 softer).
+    float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
+    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
+  }
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
-#ifdef SF_POSITIVE
-  // ── Reversal: no enlarger or print paper. The developed slide is scanned
-  // directly (engine scan_film), so the scanned densities ARE the film's. ──
-  vec3 sfCmyP = sfCmyF;
-#else
-  // ── Stage 3: print-expose (81-bin spectral) ──
-  // Live enlarger filtration is active ONLY when the stock bundle ships the
-  // neutral filter pack + dichroic spectra — a re-extraction that #defines
-  // SF_HAS_NEUTRAL (see extract_stock.py). Without it the stage compiles to the
-  // plain neutral kernel (identical to before), so old bundles keep working.
-  // When present: re-balance the baked neutral print kernel by the live/neutral
-  // ratio of the M and Y dichroic dimming factors (C held, as on a real colour
-  // head). dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the
-  // wavelength-independent t terms hoist out; M/Y dichroic spectra ride in the
-  // print/scan kernel alpha lanes.
-#ifdef SF_HAS_NEUTRAL
-  float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
-  float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
-  float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
-  float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
-#endif
-  vec3 sfRawP = vec3(0.0);
-  for (int i = 0; i < ${N_WL}; i++) {
-    float u = (float(i) + 0.5) / float(${N_WL});
-    vec4 fs = texture(filmSpec, vec2(u, 0.125));                         // row0 chD_film+baseD
-    float dspec = dot(sfCmyF, fs.rgb) + fs.a;
-    vec4 pk = texture(filmSpec, vec2(u, 0.375));                         // row1 printKernel.rgb + dichM(a)
-#ifdef SF_HAS_NEUTRAL
-    float dichY = texture(filmSpec, vec2(u, 0.875)).a;                   // row3 scanKernel.rgb + dichY(a)
-    float ratioM = (1.0 - (1.0 - pk.a) * (1.0 - sfTmL)) / (1.0 - (1.0 - pk.a) * (1.0 - sfTmN));
-    float ratioY = (1.0 - (1.0 - dichY) * (1.0 - sfTyL)) / (1.0 - (1.0 - dichY) * (1.0 - sfTyN));
-    sfRawP += sf_pow10neg(dspec) * pk.rgb * (ratioM * ratioY);
-#else
-    sfRawP += sf_pow10neg(dspec) * pk.rgb;
-#endif
-  }
-  sfRawP *= sfFactor * sfPrintExp;
-  vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
+  // Reversal (slide): no enlarger or print paper — the developed slide is scanned
+  // directly (engine scan_film), so the scanned densities ARE the film's. Negative
+  // / print: run the full enlarger print (stages 3-4). Gated on the baked
+  // sfPositive constant so the driver folds away the branch this stock skips.
+  vec3 sfCmyP;
+  if (sfPositive) {
+    sfCmyP = sfCmyF;
+  } else {
+    // ── Stage 3: print-expose (81-bin spectral) ──
+    // Live enlarger filtration is active ONLY when the stock bundle ships the
+    // neutral filter pack + dichroic spectra — a re-extraction that bakes
+    // sfHasNeutral = true (see extract_stock.py). Without it we take the plain
+    // neutral kernel (identical to before), so old bundles keep working. When
+    // present: re-balance the baked neutral print kernel by the live/neutral ratio
+    // of the M and Y dichroic dimming factors (C held, as on a real colour head).
+    // dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the wavelength-
+    // independent t terms hoist out; M/Y dichroic spectra ride in the print/scan
+    // kernel alpha lanes.
+    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
+    float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
+    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
+    float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
+    vec3 sfRawP = vec3(0.0);
+    for (int i = 0; i < ${N_WL}; i++) {
+      float u = (float(i) + 0.5) / float(${N_WL});
+      vec4 fs = texture(filmSpec, vec2(u, 0.125));                       // row0 chD_film+baseD
+      float dspec = dot(sfCmyF, fs.rgb) + fs.a;
+      vec4 pk = texture(filmSpec, vec2(u, 0.375));                       // row1 printKernel.rgb + dichM(a)
+      if (sfHasNeutral) {
+        float dichY = texture(filmSpec, vec2(u, 0.875)).a;              // row3 scanKernel.rgb + dichY(a)
+        float ratioM = (1.0 - (1.0 - pk.a) * (1.0 - sfTmL)) / (1.0 - (1.0 - pk.a) * (1.0 - sfTmN));
+        float ratioY = (1.0 - (1.0 - dichY) * (1.0 - sfTyL)) / (1.0 - (1.0 - dichY) * (1.0 - sfTyN));
+        sfRawP += sf_pow10neg(dspec) * pk.rgb * (ratioM * ratioY);
+      } else {
+        sfRawP += sf_pow10neg(dspec) * pk.rgb;
+      }
+    }
+    sfRawP *= sfFactor * sfPrintExp;
+    vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
 
-  // ── Stage 4: print-develop ──
-  // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
-  // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
-  // mid-grey put while steepening/flattening the toe and shoulder.
-  float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
-  sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
-  vec3 sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);            // morphed print
-#endif
+    // ── Stage 4: print-develop ──
+    // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
+    // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
+    // mid-grey put while steepening/flattening the toe and shoulder.
+    float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
+    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
+    sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);              // morphed print
+  }
 
   // ── Stage 5: scan (81-bin spectral → XYZ → RGB) ──
   vec3 sfXyz2 = vec3(0.0);

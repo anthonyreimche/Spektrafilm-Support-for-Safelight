@@ -1,4 +1,4 @@
-const y = `
+const n = `
 const float SF_LN10 = 2.302585093;
 
 float sf_pow10neg(float x) { return exp(-x * SF_LN10); }   // 10^(-x)
@@ -40,7 +40,7 @@ vec3 sf_gamut_compress(vec3 rgb) {
   vec3 dc = sf_reinhard_knee(d, 0.0, 1.0, 6.0);
   return vec3(ach) * (1.0 - dc);
 }
-`, n = `
+`, S = `
   // ── Stage 1: expose ──
   vec3 sfXyz = sf_apply(max(lin, 0.0) * exp2(sfExposure), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
   float sfB = max(sfXyz.x + sfXyz.y + sfXyz.z, 1e-10);
@@ -58,68 +58,65 @@ vec3 sf_gamut_compress(vec3 rgb) {
   // (sfDensMax − developed dye), negative film from the dye density itself. The
   // before-couplers curve (dc0) already bakes the positive inversion; only this
   // live donor term differs between the two paths.
-#ifdef SF_POSITIVE
-  vec3 sfSilver = sfDensMax - sfDens;
-#else
-  vec3 sfSilver = sfDens;
-#endif
+  vec3 sfSilver = sfPositive ? (sfDensMax - sfDens) : sfDens;
   vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
-#ifdef SF_POSITIVE
-  // Slides have no print to grade, so Print Contrast becomes a film-curve
-  // contrast: warp developed log-exposure around the film midpoint (1.0 = the
-  // engine's straight reversal curve; >1 harder, <1 softer).
-  float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
-  sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
-#endif
+  if (sfPositive) {
+    // Slides have no print to grade, so Print Contrast becomes a film-curve
+    // contrast: warp developed log-exposure around the film midpoint (1.0 = the
+    // engine's straight reversal curve; >1 harder, <1 softer).
+    float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
+    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
+  }
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
-#ifdef SF_POSITIVE
-  // ── Reversal: no enlarger or print paper. The developed slide is scanned
-  // directly (engine scan_film), so the scanned densities ARE the film's. ──
-  vec3 sfCmyP = sfCmyF;
-#else
-  // ── Stage 3: print-expose (81-bin spectral) ──
-  // Live enlarger filtration is active ONLY when the stock bundle ships the
-  // neutral filter pack + dichroic spectra — a re-extraction that #defines
-  // SF_HAS_NEUTRAL (see extract_stock.py). Without it the stage compiles to the
-  // plain neutral kernel (identical to before), so old bundles keep working.
-  // When present: re-balance the baked neutral print kernel by the live/neutral
-  // ratio of the M and Y dichroic dimming factors (C held, as on a real colour
-  // head). dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the
-  // wavelength-independent t terms hoist out; M/Y dichroic spectra ride in the
-  // print/scan kernel alpha lanes.
-#ifdef SF_HAS_NEUTRAL
-  float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
-  float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
-  float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
-  float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
-#endif
-  vec3 sfRawP = vec3(0.0);
-  for (int i = 0; i < 81; i++) {
-    float u = (float(i) + 0.5) / float(81);
-    vec4 fs = texture(filmSpec, vec2(u, 0.125));                         // row0 chD_film+baseD
-    float dspec = dot(sfCmyF, fs.rgb) + fs.a;
-    vec4 pk = texture(filmSpec, vec2(u, 0.375));                         // row1 printKernel.rgb + dichM(a)
-#ifdef SF_HAS_NEUTRAL
-    float dichY = texture(filmSpec, vec2(u, 0.875)).a;                   // row3 scanKernel.rgb + dichY(a)
-    float ratioM = (1.0 - (1.0 - pk.a) * (1.0 - sfTmL)) / (1.0 - (1.0 - pk.a) * (1.0 - sfTmN));
-    float ratioY = (1.0 - (1.0 - dichY) * (1.0 - sfTyL)) / (1.0 - (1.0 - dichY) * (1.0 - sfTyN));
-    sfRawP += sf_pow10neg(dspec) * pk.rgb * (ratioM * ratioY);
-#else
-    sfRawP += sf_pow10neg(dspec) * pk.rgb;
-#endif
-  }
-  sfRawP *= sfFactor * sfPrintExp;
-  vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
+  // Reversal (slide): no enlarger or print paper — the developed slide is scanned
+  // directly (engine scan_film), so the scanned densities ARE the film's. Negative
+  // / print: run the full enlarger print (stages 3-4). Gated on the baked
+  // sfPositive constant so the driver folds away the branch this stock skips.
+  vec3 sfCmyP;
+  if (sfPositive) {
+    sfCmyP = sfCmyF;
+  } else {
+    // ── Stage 3: print-expose (81-bin spectral) ──
+    // Live enlarger filtration is active ONLY when the stock bundle ships the
+    // neutral filter pack + dichroic spectra — a re-extraction that bakes
+    // sfHasNeutral = true (see extract_stock.py). Without it we take the plain
+    // neutral kernel (identical to before), so old bundles keep working. When
+    // present: re-balance the baked neutral print kernel by the live/neutral ratio
+    // of the M and Y dichroic dimming factors (C held, as on a real colour head).
+    // dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the wavelength-
+    // independent t terms hoist out; M/Y dichroic spectra ride in the print/scan
+    // kernel alpha lanes.
+    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
+    float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
+    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
+    float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
+    vec3 sfRawP = vec3(0.0);
+    for (int i = 0; i < 81; i++) {
+      float u = (float(i) + 0.5) / float(81);
+      vec4 fs = texture(filmSpec, vec2(u, 0.125));                       // row0 chD_film+baseD
+      float dspec = dot(sfCmyF, fs.rgb) + fs.a;
+      vec4 pk = texture(filmSpec, vec2(u, 0.375));                       // row1 printKernel.rgb + dichM(a)
+      if (sfHasNeutral) {
+        float dichY = texture(filmSpec, vec2(u, 0.875)).a;              // row3 scanKernel.rgb + dichY(a)
+        float ratioM = (1.0 - (1.0 - pk.a) * (1.0 - sfTmL)) / (1.0 - (1.0 - pk.a) * (1.0 - sfTmN));
+        float ratioY = (1.0 - (1.0 - dichY) * (1.0 - sfTyL)) / (1.0 - (1.0 - dichY) * (1.0 - sfTyN));
+        sfRawP += sf_pow10neg(dspec) * pk.rgb * (ratioM * ratioY);
+      } else {
+        sfRawP += sf_pow10neg(dspec) * pk.rgb;
+      }
+    }
+    sfRawP *= sfFactor * sfPrintExp;
+    vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
 
-  // ── Stage 4: print-develop ──
-  // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
-  // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
-  // mid-grey put while steepening/flattening the toe and shoulder.
-  float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
-  sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
-  vec3 sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);            // morphed print
-#endif
+    // ── Stage 4: print-develop ──
+    // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
+    // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
+    // mid-grey put while steepening/flattening the toe and shoulder.
+    float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
+    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
+    sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);              // morphed print
+  }
 
   // ── Stage 5: scan (81-bin spectral → XYZ → RGB) ──
   vec3 sfXyz2 = vec3(0.0);
@@ -146,7 +143,8 @@ const j = [
     description: "The modern portrait standard: fine grain, gentle contrast, forgiving skin tones with a warm lean.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -173,7 +171,8 @@ const vec3 sfDensMax = vec3(1.9917964,1.7988371,2.1639109);`,
     description: "Slower Portra: the finest grain of the family and the smoothest, most neutral skin rendering.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -200,7 +199,8 @@ const vec3 sfDensMax = vec3(1.671073,1.7446796,2.0252573);`,
     description: "Fast Portra for low light: more grain and punch while holding Portra's natural skin tones.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -227,7 +227,8 @@ const vec3 sfDensMax = vec3(1.8987395,1.731482,2.0255251);`,
     description: "The most saturated, finest-grained colour negative made — vivid landscapes, crisp blues and reds.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -254,7 +255,8 @@ const vec3 sfDensMax = vec3(1.8908587,1.7810741,2.2706851);`,
     description: "Consumer warmth: golden, nostalgic colour with friendly contrast and visible everyday grain.",
     tcSize: 64,
     fx: { halTint: [1, 0.25, 0], halStrength: 0.08, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -281,7 +283,8 @@ const vec3 sfDensMax = vec3(1.6278953,1.5144094,1.6873797);`,
     description: "Everyday 400-speed colour: bright, slightly punchy, with cheerful warm-leaning tones.",
     tcSize: 64,
     fx: { halTint: [1, 0.25, 0], halStrength: 0.08, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -308,7 +311,8 @@ const vec3 sfDensMax = vec3(1.8038502,1.7038919,2.0570918);`,
     description: "The discontinued cult favourite: airy pastels, minty greens and signature soft highlights.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -335,7 +339,8 @@ const vec3 sfDensMax = vec3(1.5817672,1.6053882,2.1262137);`,
     description: "Budget Fuji colour: cool, slightly green-leaning palette with crunchy, characterful grain.",
     tcSize: 64,
     fx: { halTint: [1, 0.25, 0], halStrength: 0.08, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -362,7 +367,8 @@ const vec3 sfDensMax = vec3(1.7039117,2.0405284,2.6430896);`,
     description: "Classic Superia: punchy consumer colour with the trademark Fuji emphasis on greens and reds.",
     tcSize: 64,
     fx: { halTint: [1, 0.25, 0], halStrength: 0.08, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -389,7 +395,8 @@ const vec3 sfDensMax = vec3(2.1328907,2.2501795,2.8626705);`,
     description: "Slow daylight cine stock: extremely fine grain and clean, true daylight colour.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 142857e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -416,7 +423,8 @@ const vec3 sfDensMax = vec3(1.6249524,1.6957495,1.91283);`,
     description: "Daylight-balanced cinema negative printed to 2383 — the modern motion-picture look.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 142857e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -443,7 +451,8 @@ const vec3 sfDensMax = vec3(1.6950272,1.7770826,1.9075981);`,
     description: "Tungsten-balanced cine stock: cool, cinematic cast under daylight, rich shadow detail.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 142857e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.47862433,0.51446019,0.11157035);
 const vec3 sfRgb2xyz1 = vec3(0.21797248,0.70549142,0.076537206);
 const vec3 sfRgb2xyz2 = vec3(2.3551961e-05,0.018729737,0.32730668);
@@ -470,7 +479,8 @@ const vec3 sfDensMax = vec3(1.6678537,1.6354616,1.8457941);`,
     description: "Fast tungsten cinema stock: the low-light night look, more grain and pronounced halation.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 142857e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.47862433,0.51446019,0.11157035);
 const vec3 sfRgb2xyz1 = vec3(0.21797248,0.70549142,0.076537206);
 const vec3 sfRgb2xyz2 = vec3(2.3551961e-05,0.018729737,0.32730668);
@@ -497,7 +507,8 @@ const vec3 sfDensMax = vec3(1.745149,1.6390086,1.9213218);`,
     description: "Still-photography cut of a daylight cine emulsion — clean colour with a motion-picture print.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 142857e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -524,8 +535,8 @@ const vec3 sfDensMax = vec3(1.8035683,1.6820522,1.9798795);`,
     description: "The legendary saturation slide: electric greens and reds, deep contrast — the landscape standard.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
-#define SF_POSITIVE
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = true;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -535,7 +546,7 @@ const vec3 sfCoup2 = vec3(0.054,0.054,0.054);
 const vec3 sfXyz2rgb0 = vec3(3.1425605,-1.6326138,-0.48185558);
 const vec3 sfXyz2rgb1 = vec3(-0.96974091,1.9022205,0.039872573);
 const vec3 sfXyz2rgb2 = vec3(0.059238851,-0.20070431,1.3860496);
-const float sfFactor = 1;
+const float sfFactor = 1.0;
 const float sfScanNorm = 24.451263;
 const vec2 sfLeFilm = vec2(-3,4);
 const vec2 sfLePrint = vec2(-3,4);
@@ -552,8 +563,8 @@ const vec3 sfDensMax = vec3(2.7325435,3.5745397,2.8597864);`,
     description: "The neutral professional chrome: clean, accurate colour and gentler contrast where Velvia goes punchy.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
-#define SF_POSITIVE
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = true;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -563,7 +574,7 @@ const vec3 sfCoup2 = vec3(0.078,0.078,0.078);
 const vec3 sfXyz2rgb0 = vec3(3.1425605,-1.6326138,-0.48185558);
 const vec3 sfXyz2rgb1 = vec3(-0.96974091,1.9022205,0.039872573);
 const vec3 sfXyz2rgb2 = vec3(0.059238851,-0.20070431,1.3860496);
-const float sfFactor = 1;
+const float sfFactor = 1.0;
 const float sfScanNorm = 24.451263;
 const vec2 sfLeFilm = vec2(-3,4);
 const vec2 sfLePrint = vec2(-3,4);
@@ -580,8 +591,8 @@ const vec3 sfDensMax = vec3(2.5572113,2.5458753,2.0765414);`,
     description: "Modern E-6 revival: crisp, slightly cool slide with fine grain and clean neutrals.",
     tcSize: 64,
     fx: { halTint: [1, 0.333333, 0], halStrength: 0.015, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
-#define SF_POSITIVE
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = true;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -591,7 +602,7 @@ const vec3 sfCoup2 = vec3(0.06,0.06,0.06);
 const vec3 sfXyz2rgb0 = vec3(3.1425605,-1.6326138,-0.48185558);
 const vec3 sfXyz2rgb1 = vec3(-0.96974091,1.9022205,0.039872573);
 const vec3 sfXyz2rgb2 = vec3(0.059238851,-0.20070431,1.3860496);
-const float sfFactor = 1;
+const float sfFactor = 1.0;
 const float sfScanNorm = 24.451263;
 const vec2 sfLeFilm = vec2(-3,4);
 const vec2 sfLePrint = vec2(-3,4);
@@ -608,8 +619,8 @@ const vec3 sfDensMax = vec3(2.5123477,2.8061846,2.8125636);`,
     description: "The iconic American chrome: warm reds, deep rich shadows — the National Geographic look.",
     tcSize: 64,
     fx: { halTint: [1, 0.25, 0], halStrength: 0.08, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1.6, 1.6, 3.2], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
-#define SF_POSITIVE
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = true;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -619,7 +630,7 @@ const vec3 sfCoup2 = vec3(0.06,0.06,0.06);
 const vec3 sfXyz2rgb0 = vec3(3.1425605,-1.6326138,-0.48185558);
 const vec3 sfXyz2rgb1 = vec3(-0.96974091,1.9022205,0.039872573);
 const vec3 sfXyz2rgb2 = vec3(0.059238851,-0.20070431,1.3860496);
-const float sfFactor = 1;
+const float sfFactor = 1.0;
 const float sfScanNorm = 24.451263;
 const vec2 sfLeFilm = vec2(-3,4);
 const vec2 sfLePrint = vec2(-3,4);
@@ -636,7 +647,8 @@ const vec3 sfDensMax = vec3(2.9114228,2.8048168,2.2601267);`,
     description: "The definitive reportage black-and-white: classic panchromatic tones and gutsy mid-contrast, printed on normal-grade glossy paper.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -663,7 +675,8 @@ const vec3 sfDensMax = vec3(2.3089506,2.3089506,2.3089506);`,
     description: "Britain's reportage staple: a touch softer and more forgiving than Tri-X, with long, gentle tonal gradation.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -690,7 +703,8 @@ const vec3 sfDensMax = vec3(2.1811399,2.1811399,2.1811399);`,
     description: "Classic medium-speed black-and-white: fine grain, crisp mid-contrast and beautifully clean highlights.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -717,7 +731,8 @@ const vec3 sfDensMax = vec3(2.4691846,2.4691846,2.4691846);`,
     description: "Modern tabular-grain stock: exceptionally fine grain, high sharpness and a long, clean straight line.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -744,7 +759,8 @@ const vec3 sfDensMax = vec3(2.563353,2.563353,2.563353);`,
     description: "The modern 400: noticeably finer grain than Tri-X with a smoother, more neutral tonal scale.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -771,7 +787,8 @@ const vec3 sfDensMax = vec3(2.3297951,2.3297951,2.3297951);`,
     description: "Famous for the smoothest grain of all: silky, almost grainless tones and superb reciprocity.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -798,7 +815,8 @@ const vec3 sfDensMax = vec3(2.5582988,2.5582988,2.5582988);`,
     description: "Orthochromatic (red-blind): renders reds near-black and skies dramatically light — the vintage plate look.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -825,7 +843,8 @@ const vec3 sfDensMax = vec3(2.3744649,2.3744649,2.3744649);`,
     description: "Fast and atmospheric: lower contrast, deep shadows and pronounced grain for available-light and night work.",
     tcSize: 64,
     fx: { halTint: [1, 1, 1], halStrength: 0.01, halSizeFrac: 185714e-8, halBounceDecay: 0.5, grainScale: [1, 1, 1], grainAreaUm2: 0.2, grainBlur: 0.65, glare: 0.03 },
-    consts: `#define SF_HAS_NEUTRAL
+    consts: `const bool sfHasNeutral = true;
+const bool sfPositive = false;
 const vec3 sfRgb2xyz0 = vec3(0.41965962,0.37436756,0.16280932);
 const vec3 sfRgb2xyz1 = vec3(0.21310869,0.71366087,0.073230535);
 const vec3 sfRgb2xyz2 = vec3(0.014970282,0.096458152,0.80988979);
@@ -850,31 +869,37 @@ const vec3 sfDensMax = vec3(2.0801281,2.0801281,2.0801281);`,
   grainScale: [1, 1, 1.5]
 }, m = (Q) => `vec3(${Q.map((B) => B.toFixed(4)).join(", ")})`, f = (Q) => Q.kind === "slide";
 function b(Q) {
-  const B = f(Q), D = [
-    { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
-    ...B ? [] : [{ key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" }],
-    { key: "sfCouplerAmt", glslType: "float", default: 1, range: { min: 0, max: 2, step: 0.01 }, label: "Coupler Amount" },
-    { key: "sfContrast", glslType: "float", default: 1, range: { min: 0.5, max: 2, step: 0.01 }, label: B ? "Contrast" : "Print Contrast" },
-    ...B ? [] : [
-      { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" },
-      { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" }
-    ]
-  ];
+  const B = f(Q);
   return {
     id: k,
     name: "Spektrafilm",
     phase: "tone-map",
-    uniforms: D,
+    uniforms: [
+      { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
+      { key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" },
+      { key: "sfCouplerAmt", glslType: "float", default: 1, range: { min: 0, max: 2, step: 0.01 }, label: "Coupler Amount" },
+      { key: "sfContrast", glslType: "float", default: 1, range: { min: 0.5, max: 2, step: 0.01 }, label: B ? "Contrast" : "Print Contrast" },
+      { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" },
+      { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" }
+    ],
     textures: [
       { key: "filmTc", kind: "lut", format: "rgba16f" },
       { key: "filmCurves", kind: "lut", format: "rgba16f" },
       { key: "filmSpec", kind: "lut", format: "rgba16f" }
     ],
-    // Per-stock spectral constants are inlined as GLSL consts; changing stock
-    // re-registers (recompiles) — cheap and rare. Live params stay uniforms.
-    helpers: y + `
-` + Q.consts,
-    glsl: n
+    // Per-stock spectral constants are inlined as GLSL consts. They MUST live in
+    // `glsl` (the stage body), NOT `helpers`: the host's recompile signature hashes
+    // s.glsl but NOT s.helpers (renderer.ts buildStageInjection), so with the consts
+    // in helpers every stock shares the identical FILM_GLSL body → identical sig →
+    // the program cache reuses the FIRST-compiled stock's baked consts for ALL
+    // stocks. That means a stale sfPositive (negatives scanned as positives = tones
+    // inverted; slides run the print path over zeroed lanes = white/grey) plus wrong
+    // matrices/ranges. Putting the consts in the body makes s.glsl differ per stock,
+    // so switching stock recompiles with the right consts — cheap and rare, and the
+    // intended behaviour. Live params stay uniforms.
+    helpers: n,
+    glsl: Q.consts + `
+` + S
   };
 }
 function h(Q, B = !1) {
@@ -1122,8 +1147,8 @@ function wA(Q) {
             className: "rounded bg-surface-2 px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-3",
             style: { border: "none", cursor: "pointer" },
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            onClick: (S) => {
-              S.stopPropagation(), r(P);
+            onClick: (y) => {
+              y.stopPropagation(), r(P);
             }
           },
           "Reset"

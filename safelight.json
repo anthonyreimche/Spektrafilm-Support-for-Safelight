@@ -9,5 +9,5 @@
 	"categories": ["Color"],
 	"keywords": ["film", "spektrafilm", "lut", "analog", "halation", "grain"],
 	"repository": "anthonyreimche/Spektrafilm-Support-for-Safelight",
-	"minAppVersion": "2.4.3"
+	"minAppVersion": "2.5.0"
 }

@@ -336,19 +336,31 @@ def _b64(a):
 def _vec3(v): return f"vec3({v[0]:.8g},{v[1]:.8g},{v[2]:.8g})"
 
 
+# GLSL ES has no implicit int→float conversion, so a bare-integer scalar float
+# const (`const float x = 1;` when %g drops the ".0") is a COMPILE ERROR that
+# fails the whole shader. (vec constructors are fine — they convert int args.)
+# So scalar float consts must always carry a decimal point.
+def _glf(x):
+    s = f"{x:.8g}"
+    return s if ("." in s or "e" in s or "E" in s) else s + ".0"
+
+
 def _const_block(c, positive=False):
-    # Signals to the shader that this bundle carries the neutral filter pack +
-    # dichroic spectra, enabling the live enlarger-filtration path (#ifdef guard
-    # in film-glsl.ts). Older bundles lack it and compile the plain neutral path.
-    # SF_POSITIVE marks a reversal (slide) bundle: the shader skips the print
-    # stages (3-4) and scans the developed film directly.
-    L = ["#define SF_HAS_NEUTRAL"]
-    if positive:
-        L.append("#define SF_POSITIVE")
+    # Baked gate constants read by film-glsl.ts — NOT #define/#ifdef. The host
+    # splices stage GLSL into the monolith by substring rewriting, not a C
+    # preprocessor, so #ifdef guards never take effect (slides silently ran the
+    # print path over their zeroed print lanes → a white frame). A `const bool` is
+    # a compile-time constant, so the driver still folds away the dead branch.
+    #   sfHasNeutral: bundle carries the neutral filter pack + dichroic spectra for
+    #     the live enlarger-filtration path (older bundles would set this false).
+    #   sfPositive: reversal (slide) bundle — skip the print stages (3-4) and scan
+    #     the developed film directly.
+    L = ["const bool sfHasNeutral = true;",
+         f"const bool sfPositive = {'true' if positive else 'false'};"]
     for nm, key in (("sfRgb2xyz", "rgb2xyz"), ("sfCoup", "coup"), ("sfXyz2rgb", "xyz2rgb")):
         for j in range(3): L.append(f"const vec3 {nm}{j} = {_vec3(c[key][j])};")
-    L.append(f"const float sfFactor = {c['factor']:.8g};")
-    L.append(f"const float sfScanNorm = {c['scanNorm']:.8g};")
+    L.append(f"const float sfFactor = {_glf(c['factor'])};")
+    L.append(f"const float sfScanNorm = {_glf(c['scanNorm'])};")
     L.append(f"const vec2 sfLeFilm = vec2({c['leFilm'][0]:.8g},{c['leFilm'][1]:.8g});")
     L.append(f"const vec2 sfLePrint = vec2({c['lePrint'][0]:.8g},{c['lePrint'][1]:.8g});")
     L.append(f"const vec2 sfNeutralMY = vec2({c['neutralMY'][0]:.8g},{c['neutralMY'][1]:.8g});")
